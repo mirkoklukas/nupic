@@ -289,6 +289,10 @@ class SpatialPooler(object):
     self._overlaps = numpy.zeros(self._numColumns, dtype=realDType)
     self._boostedOverlaps = numpy.zeros(self._numColumns, dtype=realDType)
 
+    # Mirko
+    zeroActivityArray = numpy.zeros(self._numColumns, dtype=realDType)
+    self._pairwiseActivity = numpy.dot(zeroActivityArray.T, zeroActivityArray)
+
     if self._synPermTrimThreshold >= self._synPermConnected:
       raise InvalidSPParamValueError(
         "synPermTrimThreshold ({}) must be less than synPermConnected ({})"
@@ -783,6 +787,9 @@ class SpatialPooler(object):
       self._updateDutyCycles(self._overlaps, activeColumns)
       self._bumpUpWeakColumns()
       self._updateBoostFactors()
+      # Mirko
+      self._updatePairwiseActivity(activeColumns)
+
       if self._isUpdateRound():
         self._updateInhibitionRadius()
         self._updateMinDutyCycles()
@@ -1300,6 +1307,18 @@ class SpatialPooler(object):
     assert(period >= 1)
     return (dutyCycles * (period -1.0) + newInput) / period
 
+  # Mirko
+  def _updatePairwiseActivity(self, activeColumns):
+    activeArray = numpy.zeros(self._numColumns, dtype=realDType)
+    activeArray[activeColumns] = 1.
+
+    period = self._dutyCyclePeriod
+    if (period > self._iterationNum):
+      period = self._iterationNum
+
+    self._pairwiseActivity = self._updateDutyCyclesHelper(
+      self._pairwiseActivity, numpy.dot(activeArray.T, activeArray), period)
+
 
   def _updateBoostFactors(self):
     """
@@ -1501,6 +1520,49 @@ class SpatialPooler(object):
 
     return numpy.array(winners, dtype=uintType)
 
+  # Mirko
+  def _inhibitColumnsMirko(self, overlaps):
+    """
+    Performs inhibition. ...
+
+    Parameters:
+    ----------------------------
+    @param overlaps: an array containing the overlap score for each  column.
+                    The overlap score for a column is defined as the number
+                    of synapses in a "connected state" (connected synapses)
+                    that are connected to input bits which are turned on.
+    """
+    # determine how many columns should be selected in the inhibition phase.
+    # This can be specified by either setting the 'numActiveColumnsPerInhArea'
+    # parameter or the 'localAreaDensity' parameter when initializing the class
+    if (self._localAreaDensity > 0):
+      density = self._localAreaDensity
+    else:
+      inhibitionArea = ((2*self._inhibitionRadius + 1)
+                                    ** self._columnDimensions.size)
+      inhibitionArea = min(self._numColumns, inhibitionArea)
+      density = float(self._numActiveColumnsPerInhArea) / inhibitionArea
+      density = min(density, 0.5)
+
+    #calculate num active per inhibition area
+    numActive = int(density * self._numColumns)
+
+    # Calculate winners using stable sort algorithm (mergesort)
+    # for compatibility with C++
+    sortedWinnerIndices = numpy.argsort(overlaps, kind='mergesort')
+
+    # Enforce the stimulus threshold
+    start = len(sortedWinnerIndices) - numActive
+    while start < len(sortedWinnerIndices):
+      i = sortedWinnerIndices[start]
+      if overlaps[i] >= self._stimulusThreshold:
+        break
+      else:
+        start += 1
+
+    return sortedWinnerIndices[start:][::-1]
+
+    
 
   def _isUpdateRound(self):
     """
