@@ -125,7 +125,8 @@ class SpatialPooler(object):
                maxBoost=10.0,
                seed=-1,
                spVerbosity=0,
-               wrapAround=True
+               wrapAround=True,
+               topologicalInhibition=False
                ):
     """
     Parameters:
@@ -290,8 +291,14 @@ class SpatialPooler(object):
     self._boostedOverlaps = numpy.zeros(self._numColumns, dtype=realDType)
 
     # Mirko
-    zeroActivityArray = numpy.zeros(self._numColumns, dtype=realDType)
+    self._topologicalInhibition = topologicalInhibition
+    zeroActivityArray = numpy.zeros((1,self._numColumns), dtype=realDType)
     self._pairwiseActivity = numpy.dot(zeroActivityArray.T, zeroActivityArray)
+    self._inhibitionGraph = {};
+    for i in range(self._numColumns):
+      self._inhibitionGraph[i] = set([])
+    if hasattr(self, '_topologicalInhibition') and self._topologicalInhibition:
+      print "Using New Inhibition...!!"
 
     if self._synPermTrimThreshold >= self._synPermConnected:
       raise InvalidSPParamValueError(
@@ -780,7 +787,14 @@ class SpatialPooler(object):
       self._boostedOverlaps = self._overlaps
 
     # Apply inhibition to determine the winning columns
-    activeColumns = self._inhibitColumns(self._boostedOverlaps)
+    # Mirko
+    # activeColumns = self._inhibitColumns(self._boostedOverlaps)
+    # activeColumns = self._inhibitColumnsMirko(self._boostedOverlaps)
+    if hasattr(self, '_topologicalInhibition') and self._topologicalInhibition:
+      activeColumns = self._inhibitColumnsMirko(self._boostedOverlaps)
+    else:
+      activeColumns = self._inhibitColumns(self._boostedOverlaps)
+      # activeColumns = self._inhibitColumnsGlobalSimplified(self._boostedOverlaps)
 
     if learn:
       self._adaptSynapses(inputVector, activeColumns)
@@ -788,11 +802,15 @@ class SpatialPooler(object):
       self._bumpUpWeakColumns()
       self._updateBoostFactors()
       # Mirko
-      self._updatePairwiseActivity(activeColumns)
+      if hasattr(self, '_topologicalInhibition') and self._topologicalInhibition:
+        self._updatePairwiseActivity(activeColumns)
 
       if self._isUpdateRound():
         self._updateInhibitionRadius()
         self._updateMinDutyCycles()
+        # Mirko
+        if hasattr(self, '_topologicalInhibition') and self._topologicalInhibition:
+          self._updateInhibitionGraph()
 
     activeArray.fill(0)
     activeArray[activeColumns] = 1
@@ -1309,6 +1327,18 @@ class SpatialPooler(object):
 
   # Mirko
   def _updatePairwiseActivity(self, activeColumns):
+    """
+      _pairwiseActivity[i,j] encodes the average activity of column j when i is active...
+
+                 _________
+           W_i  |         |
+                |   ______|___
+                |  |......|   |
+                 --|------    |
+                   |          | W_j
+                    ----------
+
+    """
     activeArray = numpy.zeros(self._numColumns, dtype=realDType)
     activeArray[activeColumns] = 1.
 
@@ -1316,8 +1346,36 @@ class SpatialPooler(object):
     if (period > self._iterationNum):
       period = self._iterationNum
 
-    self._pairwiseActivity = self._updateDutyCyclesHelper(
-      self._pairwiseActivity, numpy.dot(activeArray.T, activeArray), period)
+    for i in activeColumns:
+      for j in range(self._numColumns):
+        if i!=j:
+          self._pairwiseActivity[i,j] = self._updateDutyCyclesHelper(
+            self._pairwiseActivity[i,j], activeArray[j], period)
+
+  # Mirko
+  def _updateInhibitionGraph(self):
+    if (self._localAreaDensity > 0):
+      density = self._localAreaDensity
+    else:
+      inhibitionArea = ((2 * self._inhibitionRadius + 1)
+                        ** self._columnDimensions.size)
+      inhibitionArea = min(self._numColumns, inhibitionArea)
+      density = float(self._numActiveColumnsPerInhArea) / inhibitionArea
+      density = min(density, 0.5)
+
+    for i in range(self._numColumns):
+      for j in range(self._numColumns):
+        mutualActivity = self._pairwiseActivity[i][j]
+        if mutualActivity > density*density*2:
+          self._inhibitionGraph[i].add(j)
+        else:  
+          if j in self._inhibitionGraph[i]:
+            self._inhibitionGraph[i].remove(j)
+
+
+
+
+
 
 
   def _updateBoostFactors(self):
@@ -1520,6 +1578,40 @@ class SpatialPooler(object):
 
     return numpy.array(winners, dtype=uintType)
 
+  # Mirko  
+  def _inhibitColumnsGlobalSimplified(self, overlaps):
+    """
+    Perform global inhibition. Performing global inhibition entails picking the
+    top 'numActive' columns with the highest overlap score in the entire
+    region. At most half of the columns in a local neighborhood are allowed to
+    be active. Columns with an overlap score below the 'stimulusThreshold' are
+    always inhibited.
+
+    @param overlaps: an array containing the overlap score for each  column.
+                    The overlap score for a column is defined as the number
+                    of synapses in a "connected state" (connected synapses)
+                    that are connected to input bits which are turned on.
+    @param density: The fraction of columns to survive inhibition.
+    @return list with indices of the winning columns
+    """
+    if (self._localAreaDensity > 0):
+      density = self._localAreaDensity
+    else:
+      inhibitionArea = ((2*self._inhibitionRadius + 1)
+                                    ** self._columnDimensions.size)
+      inhibitionArea = min(self._numColumns, inhibitionArea)
+      density = float(self._numActiveColumnsPerInhArea) / inhibitionArea
+      density = min(density, 0.5)
+    #calculate num active per inhibition area
+    numActive = int(density * self._numColumns)
+
+    # Calculate winners using stable sort algorithm (mergesort)
+    # for compatibility with C++
+    sortedWinnerIndices = numpy.argsort(overlaps, kind='mergesort')[::-1]
+
+    return sortedWinnerIndices[:numActive]
+
+
   # Mirko
   def _inhibitColumnsMirko(self, overlaps):
     """
@@ -1545,22 +1637,34 @@ class SpatialPooler(object):
       density = min(density, 0.5)
 
     #calculate num active per inhibition area
-    numActive = int(density * self._numColumns)
+    numColumns = self._numColumns
+    numActive = int(density * numColumns)
 
     # Calculate winners using stable sort algorithm (mergesort)
     # for compatibility with C++
-    sortedWinnerIndices = numpy.argsort(overlaps, kind='mergesort')
+    sortedByOverlap = numpy.argsort(overlaps, kind='mergesort')[:][::-1]
 
-    # Enforce the stimulus threshold
-    start = len(sortedWinnerIndices) - numActive
-    while start < len(sortedWinnerIndices):
-      i = sortedWinnerIndices[start]
-      if overlaps[i] >= self._stimulusThreshold:
-        break
-      else:
-        start += 1
 
-    return sortedWinnerIndices[start:][::-1]
+    # # Enforce the stimulus threshold
+    # start = len(sortedWinnerIndices) - numActive
+    # while start < len(sortedWinnerIndices):
+    #   i = sortedWinnerIndices[start]
+    #   if overlaps[i] >= self._stimulusThreshold:
+    #     break
+    #   else:
+    #     start += 1
+    mask = numpy.ones(numColumns)
+    for i, sortedIndex in enumerate(sortedByOverlap):
+      if mask[i] == 1:
+        for j in sortedByOverlap[sortedIndex+1:]:
+          mutualActivity = self._pairwiseActivity[i][j]
+
+          if mutualActivity > density*density*2:
+            mask[j] = 0 
+
+    return numpy.array([i for i in sortedByOverlap if mask[i]==1])[:numActive]
+
+
 
     
 
