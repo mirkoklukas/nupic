@@ -1,3 +1,5 @@
+
+
 # ----------------------------------------------------------------------
 # Numenta Platform for Intelligent Computing (NuPIC)
 # Copyright (C) 2013-2016, Numenta, Inc.  Unless you have an agreement
@@ -90,6 +92,23 @@ class BinaryCorticalColumns(_SparseMatrixCorticalColumnAdapter,
   """
   pass
 
+def getConnectedSyns(sp):
+  numInputs = sp.getNumInputs()
+  numColumns = numpy.prod(sp.getColumnDimensions())
+  connectedSyns = numpy.zeros((numColumns, numInputs), dtype=uintType)
+  for columnIndex in range(numColumns):
+    sp.getConnectedSynapses(columnIndex, connectedSyns[columnIndex, :])
+  connectedSyns = connectedSyns.astype('float32')
+  return connectedSyns
+
+def getPermanences(sp):
+  numInputs = sp.getNumInputs()
+  numColumns = numpy.prod(sp.getColumnDimensions())
+  connectedSyns = numpy.zeros((numColumns, numInputs), dtype=uintType)
+  for columnIndex in range(numColumns):
+    sp.getPermanence(columnIndex, connectedSyns[columnIndex, :])
+  connectedSyns = connectedSyns.astype('float32')
+  return connectedSyns
 
 
 class SpatialPooler(object):
@@ -238,7 +257,7 @@ class SpatialPooler(object):
       Determines if inputs at the beginning and end of an input dimension should
       be considered neighbors when mapping columns to inputs.
     """
-    print "spatial pooler with ...topological inhibition"
+    print "spatial pooler with ...batch learning...."
     if (numActiveColumnsPerInhArea == 0 and
         (localAreaDensity == 0 or localAreaDensity > 0.5)):
       raise InvalidSPParamValueError("Inhibition parameters are invalid")
@@ -291,16 +310,25 @@ class SpatialPooler(object):
     self._overlaps = numpy.zeros(self._numColumns, dtype=realDType)
     self._boostedOverlaps = numpy.zeros(self._numColumns, dtype=realDType)
 
-    # Mirko
-    self._topologicalInhibition = topologicalInhibition
-    # zeroActivityArray = numpy.zeros((self._numColumns. self._numColumns), dtype=realDType)
-    self._pairwiseActivity = numpy.zeros((self._numColumns, self._numColumns), dtype=realDType)
-    self._inhibitionGraph = {};
-    for i in range(self._numColumns):
-      self._inhibitionGraph[i] = set([])
-    if hasattr(self, '_topologicalInhibition') and self._topologicalInhibition:
-      print "Using New Inhibition...!!"
 
+    if (self._localAreaDensity > 0):
+      density = self._localAreaDensity
+    else:
+      inhibitionArea = ((2*self._inhibitionRadius + 1)
+                                    ** self._columnDimensions.size)
+      inhibitionArea = min(self._numColumns, inhibitionArea)
+      density = float(self._numActiveColumnsPerInhArea) / inhibitionArea
+      density = min(density, 0.5)
+    #calculate num active per inhibition area
+    self._numActive = int(density * self._numColumns)
+
+
+    self._topologicalInhibition = topologicalInhibition
+    self._pairwiseActivity = numpy.zeros((self._numColumns, self._numColumns), dtype=realDType)
+    self._inhibitionGraph = dict([    (i, set([]))    for i in range(self._numColumns)]);
+    self._probabilities = numpy.zeros((self._numColumns, self._numColumns), dtype=realDType)
+
+    self._edgeBoostFactors = numpy.ones((self._numColumns, self._numColumns), dtype=realDType)
     if self._synPermTrimThreshold >= self._synPermConnected:
       raise InvalidSPParamValueError(
         "synPermTrimThreshold ({}) must be less than synPermConnected ({})"
@@ -816,6 +844,168 @@ class SpatialPooler(object):
 
     activeArray.fill(0)
     activeArray[activeColumns] = 1
+
+  def learnBatch(self, inputVectors):
+    """
+    This is the primary public method of the SpatialPooler class. This
+    function takes a input vector and outputs the indices of the active columns.
+    If 'learn' is set to True, this method also updates the permanences of the
+    columns.
+
+    @param inputVector: A numpy array of 0's and 1's that comprises the input
+        to the spatial pooler. The array will be treated as a one dimensional
+        array, therefore the dimensions of the array do not have to match the
+        exact dimensions specified in the class constructor. In fact, even a
+        list would suffice. The number of input bits in the vector must,
+        however, match the number of bits specified by the call to the
+        constructor. Therefore there must be a '0' or '1' in the array for
+        every input bit.
+    @param learn: A boolean value indicating whether learning should be
+        performed. Learning entails updating the  permanence values of the
+        synapses, and hence modifying the 'state' of the model. Setting
+        learning to 'off' freezes the SP and has many uses. For example, you
+        might want to feed in various inputs and examine the resulting SDR's.
+    @param activeArray: An array whose size is equal to the number of columns.
+        Before the function returns this array will be populated with 1's at
+        the indices of the active columns, and 0's everywhere else.
+    """
+
+    outputVectors = numpy.zeros((inputVectors.shape[0], self._numColumns), dtype=realDType)
+    outputLists   = []
+    batchSize     = inputVectors.shape[0]
+    numColumns = self._numColumns
+    for i in range(batchSize):
+      inputVector = inputVectors[i]
+      activeArray = numpy.zeros(self._numColumns, dtype=realDType)
+
+
+      
+
+      # self._overlaps = self._calculateOverlap(inputVector)
+      connectionMatrix = getConnectedSyns(self)
+      # connectionMatrix = getPermanences(self)
+      # for c in range(numColumns):
+        # self._overlaps[c]   = - numpy.sum(numpy.absolute(connectionMatrix[c] - inputVector))
+
+
+
+      if self._overlapDistance == True:
+        self._overlaps = self._calculateOverlap(inputVector)
+      else:
+        self._overlaps =2.*784 - numpy.sum(numpy.absolute(connectionMatrix - inputVector),1)
+      # 
+      # 
+      #  New extended boosting
+      # 
+      # 
+      self._boostedOverlaps = self._boostFactors * self._overlaps
+
+      if self._topologicalInhibition:
+
+        # 
+        #  Update the graph
+        # 
+        numColumns = self._numColumns
+        sortedByOverlap = numpy.argsort(self._boostedOverlaps, kind='mergesort')[:][::-1]
+        for a, pos in enumerate(sortedByOverlap):
+          for b in sortedByOverlap[pos + 1:]:
+              self._boostedOverlaps[b] *= self._edgeBoostFactors[a,b]
+
+
+
+
+      # activeColumns = self._inhibitColumnsGlobalSimplified(self._boostedOverlaps)
+      activeColumns = numpy.argsort(self._boostedOverlaps, kind='mergesort')[-self._numActive:]
+      # print activeColumns
+
+      outputLists.append(activeColumns)
+
+
+  
+      activeArray.fill(0)
+      activeArray[activeColumns] = 1
+      outputVectors[i] = activeArray
+
+    for i in range(batchSize):
+      activeColumns = outputLists[i]
+      inputVector   = inputVectors[i]
+      self._adaptSynapses(inputVector, activeColumns)
+
+
+    # 
+    #  Computing probabilities p_i and p_ij 
+    #  (that is p_ij = P(Lambda_i=1, Lambda_j=1 ))
+    # 
+    self._probabilities = numpy.zeros((self._numColumns, self._numColumns), dtype=realDType)  
+    for k in range(batchSize):
+      activeColumns = outputLists[k]
+      # activeColumns = numpy.where( outputVectors[k] > 0 )
+      for i in activeColumns:
+        for j in activeColumns:
+          self._probabilities[i,j] += 1.
+
+    self._probabilities = self._probabilities/batchSize
+
+    self._mutualInfo = numpy.zeros((self._numColumns, self._numColumns), dtype=realDType)  
+    for i in range(numColumns):
+        for j in range(i+1, numColumns):
+          pij = self._probabilities[i,j]
+          pi  = self._probabilities[i,i]
+          pj  = self._probabilities[j,j]
+          p11 = pij
+          p00 = 1 - pi - pj + pij
+          p01 = pj - pij
+          p10 = pi - pij
+
+          self._mutualInfo[i,j] = numpy.sum([
+              p11*numpy.log2(p11 / (     pi  * pj      )    ) if p11>0 else 0.,
+              p01*numpy.log2(p01 / ((1 - pi) * pj      )    ) if p01>0 else 0.,
+              p10*numpy.log2(p10 / (     pi  * (1 - pj))    ) if p10>0 else 0.,
+              p00*numpy.log2(p00 / ((1 - pi) * (1 - pj))    ) if p00>0 else 0.
+          ])
+
+    # 
+    #  Regular boost factors
+    # 
+    density = self._localAreaDensity
+    targetDensity = density
+    self._boostFactors = self._updateDutyCyclesHelper(
+      self._boostFactors,
+      numpy.exp(-(
+        self._probabilities.diagonal() - targetDensity) * self._maxBoost),
+      50.)
+
+    tooClose = 1.
+    meanij = 0.
+    meani = 0.
+    if self._topologicalInhibition:
+      # 
+      #  Update the graph
+      # 
+      
+      for i in range(numColumns):
+        for j in range(numColumns):
+          if i != j:
+            pij = self._probabilities[i,j]
+            pi  = self._probabilities[i,i]
+            pj  = self._probabilities[j,j]
+            boost = 1.
+            if pij > pi*pj:
+              tooClose += 1
+              meanij +=  pij
+              meani  += pi*pj
+              boost = numpy.exp(- ((pij - pi*pj)*400.))  
+
+            self._edgeBoostFactors[i,j] = self._updateDutyCyclesHelper(
+                                              self._edgeBoostFactors[i,j],
+                                              boost,
+                                              50.)
+    print tooClose
+    print meanij/tooClose, meani/tooClose, (meanij - meani)/tooClose
+
+
+    return outputVectors
+
 
 
   def stripUnlearnedColumns(self, activeArray):
@@ -1926,3 +2116,6 @@ class SpatialPooler(object):
     print "maxBoost                   = ", self.getMaxBoost()
     print "spVerbosity                = ", self.getSpVerbosity()
     print "version                    = ", self._version
+
+
+
